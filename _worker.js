@@ -1,1268 +1,1227 @@
-// Cloudflare Worker - 简化版优选工具
-// 仅保留优选域名、优选IP、GitHub、上报和节点生成功能
+const encoder = new TextEncoder();
+let expiredAt = null;
+let endpoint = null;
+// 添加缓存相关变量
+let voiceListCache = null;
+let voiceListCacheTime = null;
+const VOICE_CACHE_DURATION =4 *60 * 60 * 1000; // 4小时，单位毫秒
 
-// 默认配置
-let customPreferredIPs = [];
-let customPreferredDomains = [];
-let epd = true;  // 启用优选域名
-let epi = true;  // 启用优选IP
-let egi = true;  // 启用GitHub优选
-let ev = true;   // 启用VLESS协议
-let et = false;  // 启用Trojan协议
-let vm = false;  // 启用VMess协议
-let scu = 'https://url.v1.mk/sub';  // 订阅转换地址
-
-// 默认优选域名列表
-const directDomains = [
-    { name: "cloudflare.182682.xyz", domain: "cloudflare.182682.xyz" },
-    { domain: "freeyx.cloudflare88.eu.org" },
-    { domain: "bestcf.top" },
-    { domain: "cdn.2020111.xyz" },
-    { domain: "cf.0sm.com" },
-    { domain: "cf.090227.xyz" },
-    { domain: "cf.zhetengsha.eu.org" },
-    { domain: "cfip.1323123.xyz" },
-    { domain: "cloudflare-ip.mofashi.ltd" },
-    { domain: "cf.877771.xyz" },
-    { domain: "xn--b6gac.eu.org" }
+// 定义需要保留的 SSML 标签模式
+const preserveTags = [
+  { name: 'break', pattern: /<break\s+[^>]*\/>/g },
+  { name: 'speak', pattern: /<speak>|<\/speak>/g },
+  { name: 'prosody', pattern: /<prosody\s+[^>]*>|<\/prosody>/g },
+  { name: 'emphasis', pattern: /<emphasis\s+[^>]*>|<\/emphasis>/g },
+  { name: 'voice', pattern: /<voice\s+[^>]*>|<\/voice>/g },
+  { name: 'say-as', pattern: /<say-as\s+[^>]*>|<\/say-as>/g },
+  { name: 'phoneme', pattern: /<phoneme\s+[^>]*>|<\/phoneme>/g },
+  { name: 'audio', pattern: /<audio\s+[^>]*>|<\/audio>/g },
+  { name: 'p', pattern: /<p>|<\/p>/g },
+  { name: 's', pattern: /<s>|<\/s>/g },
+  { name: 'sub', pattern: /<sub\s+[^>]*>|<\/sub>/g },
+  { name: 'mstts', pattern: /<mstts:[^>]*>|<\/mstts:[^>]*>/g }
 ];
 
-// 默认优选IP来源URL
-const defaultIPURL = 'https://raw.githubusercontent.com/qwer-search/bestip/refs/heads/main/kejilandbestip.txt';
-
-// UUID验证
-function isValidUUID(str) {
-    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    return uuidRegex.test(str);
+function uuid(){
+  return crypto.randomUUID().replace(/-/g, '')
 }
 
-// 从环境变量获取配置
-function getConfigValue(key, defaultValue) {
-    return defaultValue || '';
-}
+// EscapeSSML 转义 SSML 内容，但保留配置的标签
+function escapeSSML(ssml) {
+  // 使用占位符替换标签
+  let placeholders = new Map();
+  let processedSSML = ssml;
+  let counter = 0;
 
-// 获取动态IP列表（支持IPv4/IPv6和运营商筛选）
-async function fetchDynamicIPs(ipv4Enabled = true, ipv6Enabled = true, ispMobile = true, ispUnicom = true, ispTelecom = true) {
-    const v4Url = "https://www.wetest.vip/page/cloudflare/address_v4.html";
-    const v6Url = "https://www.wetest.vip/page/cloudflare/address_v6.html";
-    let results = [];
-
-    try {
-        const fetchPromises = [];
-        if (ipv4Enabled) {
-            fetchPromises.push(fetchAndParseWetest(v4Url));
-        } else {
-            fetchPromises.push(Promise.resolve([]));
-        }
-        if (ipv6Enabled) {
-            fetchPromises.push(fetchAndParseWetest(v6Url));
-        } else {
-            fetchPromises.push(Promise.resolve([]));
-        }
-
-        const [ipv4List, ipv6List] = await Promise.all(fetchPromises);
-        results = [...ipv4List, ...ipv6List];
-        
-        // 按运营商筛选
-        if (results.length > 0) {
-            results = results.filter(item => {
-                const isp = item.isp || '';
-                if (isp.includes('移动') && !ispMobile) return false;
-                if (isp.includes('联通') && !ispUnicom) return false;
-                if (isp.includes('电信') && !ispTelecom) return false;
-                return true;
-            });
-        }
-        
-        return results.length > 0 ? results : [];
-    } catch (e) {
-        return [];
-    }
-}
-
-// 解析wetest页面
-async function fetchAndParseWetest(url) {
-    try {
-        const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-        if (!response.ok) return [];
-        const html = await response.text();
-        const results = [];
-        const rowRegex = /<tr[\s\S]*?<\/tr>/g;
-        const cellRegex = /<td data-label="线路名称">(.+?)<\/td>[\s\S]*?<td data-label="优选地址">([\d.:a-fA-F]+)<\/td>[\s\S]*?<td data-label="数据中心">(.+?)<\/td>/;
-
-        let match;
-        while ((match = rowRegex.exec(html)) !== null) {
-            const rowHtml = match[0];
-            const cellMatch = rowHtml.match(cellRegex);
-            if (cellMatch && cellMatch[1] && cellMatch[2]) {
-                const colo = cellMatch[3] ? cellMatch[3].trim().replace(/<.*?>/g, '') : '';
-                results.push({
-                    isp: cellMatch[1].trim().replace(/<.*?>/g, ''),
-                    ip: cellMatch[2].trim(),
-                    colo: colo
-                });
-            }
-        }
-        return results;
-    } catch (error) {
-        return [];
-    }
-}
-
-// 从GitHub获取优选IP
-async function fetchAndParseNewIPs(piu) {
-    const url = piu || defaultIPURL;
-    try {
-        const response = await fetch(url);
-        if (!response.ok) return [];
-        const text = await response.text();
-        const results = [];
-        const lines = text.trim().replace(/\r/g, "").split('\n');
-        const regex = /^([^:]+):(\d+)#(.*)$/;
-
-        for (const line of lines) {
-            const trimmedLine = line.trim();
-            if (!trimmedLine) continue;
-            const match = trimmedLine.match(regex);
-            if (match) {
-                results.push({
-                    ip: match[1],
-                    port: parseInt(match[2], 10),
-                    name: match[3].trim() || match[1]
-                });
-            }
-        }
-        return results;
-    } catch (error) {
-        return [];
-    }
-}
-
-// 生成VLESS链接
-function generateLinksFromSource(list, user, workerDomain, disableNonTLS = false, customPath = '/') {
-    const CF_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
-    const CF_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
-    const defaultHttpsPorts = [443];
-    const defaultHttpPorts = disableNonTLS ? [] : [80];
-    const links = [];
-    const wsPath = customPath || '/';
-    const proto = 'vless';
-
-    list.forEach(item => {
-        let nodeNameBase = item.isp ? item.isp.replace(/\s/g, '_') : (item.name || item.domain || item.ip);
-        if (item.colo && item.colo.trim()) {
-            nodeNameBase = `${nodeNameBase}-${item.colo.trim()}`;
-        }
-        const safeIP = item.ip.includes(':') ? `[${item.ip}]` : item.ip;
-        
-        let portsToGenerate = [];
-        
-        if (item.port) {
-            const port = item.port;
-            if (CF_HTTPS_PORTS.includes(port)) {
-                portsToGenerate.push({ port: port, tls: true });
-            } else if (CF_HTTP_PORTS.includes(port)) {
-                portsToGenerate.push({ port: port, tls: false });
-            } else {
-                portsToGenerate.push({ port: port, tls: true });
-            }
-        } else {
-            defaultHttpsPorts.forEach(port => {
-                portsToGenerate.push({ port: port, tls: true });
-            });
-            defaultHttpPorts.forEach(port => {
-                portsToGenerate.push({ port: port, tls: false });
-            });
-        }
-
-        portsToGenerate.forEach(({ port, tls }) => {
-            if (tls) {
-                const wsNodeName = `${nodeNameBase}-${port}-WS-TLS`;
-                const wsParams = new URLSearchParams({ 
-                    encryption: 'none', 
-                    security: 'tls', 
-                    sni: workerDomain, 
-                    fp: 'chrome', 
-                    type: 'ws', 
-                    host: workerDomain, 
-                    path: wsPath
-                });
-                links.push(`${proto}://${user}@${safeIP}:${port}?${wsParams.toString()}#${encodeURIComponent(wsNodeName)}`);
-            } else {
-                const wsNodeName = `${nodeNameBase}-${port}-WS`;
-                const wsParams = new URLSearchParams({
-                    encryption: 'none',
-                    security: 'none',
-                    type: 'ws',
-                    host: workerDomain,
-                    path: wsPath
-                });
-                links.push(`${proto}://${user}@${safeIP}:${port}?${wsParams.toString()}#${encodeURIComponent(wsNodeName)}`);
-            }
-        });
+  // 处理所有配置的标签
+  for (const tag of preserveTags) {
+    processedSSML = processedSSML.replace(tag.pattern, function(match) {
+      const placeholder = `__SSML_PLACEHOLDER_${tag.name}_${counter++}__`;
+      placeholders.set(placeholder, match);
+      return placeholder;
     });
-    return links;
+  }
+
+  // 对处理后的文本进行HTML转义
+  let escapedContent = escapeBasicXml(processedSSML);
+
+  // 恢复所有标签占位符
+  placeholders.forEach((tag, placeholder) => {
+    escapedContent = escapedContent.replace(placeholder, tag);
+  });
+
+  return escapedContent;
 }
 
-// 生成Trojan链接
-async function generateTrojanLinksFromSource(list, user, workerDomain, disableNonTLS = false, customPath = '/') {
-    const CF_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
-    const CF_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
-    const defaultHttpsPorts = [443];
-    const defaultHttpPorts = disableNonTLS ? [] : [80];
-    const links = [];
-    const wsPath = customPath || '/';
-    const password = user;  // Trojan使用UUID作为密码
-
-    list.forEach(item => {
-        let nodeNameBase = item.isp ? item.isp.replace(/\s/g, '_') : (item.name || item.domain || item.ip);
-        if (item.colo && item.colo.trim()) {
-            nodeNameBase = `${nodeNameBase}-${item.colo.trim()}`;
-        }
-        const safeIP = item.ip.includes(':') ? `[${item.ip}]` : item.ip;
-        
-        let portsToGenerate = [];
-        
-        if (item.port) {
-            const port = item.port;
-            if (CF_HTTPS_PORTS.includes(port)) {
-                portsToGenerate.push({ port: port, tls: true });
-            } else if (CF_HTTP_PORTS.includes(port)) {
-                if (!disableNonTLS) {
-                    portsToGenerate.push({ port: port, tls: false });
-                }
-            } else {
-                portsToGenerate.push({ port: port, tls: true });
-            }
-        } else {
-            defaultHttpsPorts.forEach(port => {
-                portsToGenerate.push({ port: port, tls: true });
-            });
-            defaultHttpPorts.forEach(port => {
-                portsToGenerate.push({ port: port, tls: false });
-            });
-        }
-
-        portsToGenerate.forEach(({ port, tls }) => {
-            if (tls) {
-                const wsNodeName = `${nodeNameBase}-${port}-Trojan-WS-TLS`;
-                const wsParams = new URLSearchParams({ 
-                    security: 'tls', 
-                    sni: workerDomain, 
-                    fp: 'chrome', 
-                    type: 'ws', 
-                    host: workerDomain, 
-                    path: wsPath
-                });
-                links.push(`trojan://${password}@${safeIP}:${port}?${wsParams.toString()}#${encodeURIComponent(wsNodeName)}`);
-            } else {
-                const wsNodeName = `${nodeNameBase}-${port}-Trojan-WS`;
-                const wsParams = new URLSearchParams({
-                    security: 'none',
-                    type: 'ws',
-                    host: workerDomain,
-                    path: wsPath
-                });
-                links.push(`trojan://${password}@${safeIP}:${port}?${wsParams.toString()}#${encodeURIComponent(wsNodeName)}`);
-            }
-        });
-    });
-    return links;
+// 基本 XML 转义功能，只处理基本字符
+function escapeBasicXml(unsafe) {
+  return unsafe.replace(/[<>&'"]/g, function (c) {
+    switch (c) {
+      case '<': return '&lt;';
+      case '>': return '&gt;';
+      case '&': return '&amp;';
+      case '\'': return '&apos;';
+      case '"': return '&quot;';
+    }
+  });
 }
 
-// 生成VMess链接
-function generateVMessLinksFromSource(list, user, workerDomain, disableNonTLS = false, customPath = '/') {
-    const CF_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
-    const CF_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
-    const defaultHttpsPorts = [443];
-    const defaultHttpPorts = disableNonTLS ? [] : [80];
-    const links = [];
-    const wsPath = customPath || '/';
+async function handleRequest(request) {
+  const requestUrl = new URL(request.url);
+  const path = requestUrl.pathname;
 
-    list.forEach(item => {
-        let nodeNameBase = item.isp ? item.isp.replace(/\s/g, '_') : (item.name || item.domain || item.ip);
-        if (item.colo && item.colo.trim()) {
-            nodeNameBase = `${nodeNameBase}-${item.colo.trim()}`;
-        }
-        const safeIP = item.ip.includes(':') ? `[${item.ip}]` : item.ip;
-        
-        let portsToGenerate = [];
-        
-        if (item.port) {
-            const port = item.port;
-            if (CF_HTTPS_PORTS.includes(port)) {
-                portsToGenerate.push({ port: port, tls: true });
-            } else if (CF_HTTP_PORTS.includes(port)) {
-                if (!disableNonTLS) {
-                    portsToGenerate.push({ port: port, tls: false });
-                }
-            } else {
-                portsToGenerate.push({ port: port, tls: true });
-            }
-        } else {
-            defaultHttpsPorts.forEach(port => {
-                portsToGenerate.push({ port: port, tls: true });
-            });
-            defaultHttpPorts.forEach(port => {
-                portsToGenerate.push({ port: port, tls: false });
-            });
-        }
+  if (path === '/tts') {
+    // 从请求参数获取 API 密钥
+    const apiKey = requestUrl.searchParams.get('api_key');
 
-        portsToGenerate.forEach(({ port, tls }) => {
-            const vmessConfig = {
-                v: "2",
-                ps: tls ? `${nodeNameBase}-${port}-VMess-WS-TLS` : `${nodeNameBase}-${port}-VMess-WS`,
-                add: safeIP,
-                port: port.toString(),
-                id: user,
-                aid: "0",
-                scy: "auto",
-                net: "ws",
-                type: "none",
-                host: workerDomain,
-                path: wsPath,
-                tls: tls ? "tls" : "none"
-            };
-            if (tls) {
-                vmessConfig.sni = workerDomain;
-                vmessConfig.fp = "chrome";
-            }
-            const vmessBase64 = btoa(JSON.stringify(vmessConfig));
-            links.push(`vmess://${vmessBase64}`);
-        });
-    });
-    return links;
-}
-
-// 从GitHub IP生成链接（VLESS）
-function generateLinksFromNewIPs(list, user, workerDomain, customPath = '/') {
-    const CF_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
-    const CF_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
-    const links = [];
-    const wsPath = customPath || '/';
-    const proto = 'vless';
-    
-    list.forEach(item => {
-        const nodeName = item.name.replace(/\s/g, '_');
-        const port = item.port;
-        
-        if (CF_HTTPS_PORTS.includes(port)) {
-            const wsNodeName = `${nodeName}-${port}-WS-TLS`;
-            const link = `${proto}://${user}@${item.ip}:${port}?encryption=none&security=tls&sni=${workerDomain}&fp=chrome&type=ws&host=${workerDomain}&path=${wsPath}#${encodeURIComponent(wsNodeName)}`;
-            links.push(link);
-        } else if (CF_HTTP_PORTS.includes(port)) {
-            const wsNodeName = `${nodeName}-${port}-WS`;
-            const link = `${proto}://${user}@${item.ip}:${port}?encryption=none&security=none&type=ws&host=${workerDomain}&path=${wsPath}#${encodeURIComponent(wsNodeName)}`;
-            links.push(link);
-        } else {
-            const wsNodeName = `${nodeName}-${port}-WS-TLS`;
-            const link = `${proto}://${user}@${item.ip}:${port}?encryption=none&security=tls&sni=${workerDomain}&fp=chrome&type=ws&host=${workerDomain}&path=${wsPath}#${encodeURIComponent(wsNodeName)}`;
-            links.push(link);
-        }
-    });
-    return links;
-}
-
-// 生成订阅内容
-async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4Enabled, ipv6Enabled, ispMobile, ispUnicom, ispTelecom, evEnabled, etEnabled, vmEnabled, disableNonTLS, customPath) {
-    const url = new URL(request.url);
-    const finalLinks = [];
-    const workerDomain = url.hostname;  // workerDomain始终是请求的hostname
-    const nodeDomain = customDomain || url.hostname;  // 用户输入的域名用于生成节点时的host/sni
-    const target = url.searchParams.get('target') || 'base64';
-    const wsPath = customPath || '/';
-
-    async function addNodesFromList(list) {
-        // 确保至少有一个协议被启用
-        const hasProtocol = evEnabled || etEnabled || vmEnabled;
-        const useVL = hasProtocol ? evEnabled : true;  // 如果没有选择任何协议，默认使用VLESS
-        
-        if (useVL) {
-            finalLinks.push(...generateLinksFromSource(list, user, nodeDomain, disableNonTLS, wsPath));
-        }
-        if (etEnabled) {
-            finalLinks.push(...await generateTrojanLinksFromSource(list, user, nodeDomain, disableNonTLS, wsPath));
-        }
-        if (vmEnabled) {
-            finalLinks.push(...generateVMessLinksFromSource(list, user, nodeDomain, disableNonTLS, wsPath));
-        }
+    // 验证 API 密钥
+    if (!validateApiKey(apiKey)) {
+      // 改进 401 错误响应，提供更友好的错误信息
+      return new Response(JSON.stringify({
+        error: 'Unauthorized',
+        message: '无效的 API 密钥，请确保您提供了正确的密钥。',
+        status: 401
+      }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json; charset=utf-8' }
+      });
     }
 
-    // 原生地址
-    const nativeList = [{ ip: workerDomain, isp: '原生地址' }];
-    await addNodesFromList(nativeList);
+    const text = requestUrl.searchParams.get('t') || '';
+    const voiceName = requestUrl.searchParams.get('v') || 'zh-CN-XiaoxiaoMultilingualNeural';
+    const rate =  Number(requestUrl.searchParams.get('r')) || 0;
+    const pitch = Number(requestUrl.searchParams.get('p')) || 0;
+    const style = requestUrl.searchParams.get('s') || 'general';
+    const outputFormat = requestUrl.searchParams.get('o') || 'audio-24khz-48kbitrate-mono-mp3';
+    const download = requestUrl.searchParams.get('d') || false;
+    const response = await getVoice(text, voiceName, rate, pitch, style, outputFormat, download);
+    return response;
+  }
 
-    // 优选域名
-    if (epd) {
-        const domainList = directDomains.map(d => ({ ip: d.domain, isp: d.name || d.domain }));
-        await addNodesFromList(domainList);
+  // 添加 reader.json 路径处理
+  if (path === '/reader.json') {
+    // 从请求参数获取 API 密钥
+    const apiKey = requestUrl.searchParams.get('api_key');
+
+    // 验证 API 密钥
+    if (!validateApiKey(apiKey)) {
+      return new Response(JSON.stringify({
+        error: 'Unauthorized',
+        message: '无效的 API 密钥，请确保您提供了正确的密钥。',
+        status: 401
+      }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json; charset=utf-8' }
+      });
     }
 
-    // 优选IP
-    if (epi) {
-        try {
-            const dynamicIPList = await fetchDynamicIPs(ipv4Enabled, ipv6Enabled, ispMobile, ispUnicom, ispTelecom);
-            if (dynamicIPList.length > 0) {
-                await addNodesFromList(dynamicIPList);
-            }
-        } catch (error) {
-            console.error('获取动态IP失败:', error);
-        }
+    // 从URL参数获取
+    const voice = requestUrl.searchParams.get('v') || '';
+    const rate = requestUrl.searchParams.get('r') || '';
+    const pitch = requestUrl.searchParams.get('p') || '';
+    const style = requestUrl.searchParams.get('s') || '';
+    const displayName = requestUrl.searchParams.get('n') || 'Microsoft TTS';
+
+    // 构建基本URL
+    const baseUrl = `${requestUrl.protocol}//${requestUrl.host}`;
+
+    // 构建URL参数
+    const urlParams = ["t={{java.encodeURI(speakText)}}", "r={{speakSpeed*4}}"];
+
+    // 只有有值的参数才添加
+    if (voice) {
+      urlParams.push(`v=${voice}`);
     }
 
-    // GitHub优选
-    if (egi) {
-        try {
-            const newIPList = await fetchAndParseNewIPs(piu);
-            if (newIPList.length > 0) {
-                // 确保至少有一个协议被启用
-                const hasProtocol = evEnabled || etEnabled || vmEnabled;
-                const useVL = hasProtocol ? evEnabled : true;  // 如果没有选择任何协议，默认使用VLESS
-                
-                if (useVL) {
-                    finalLinks.push(...generateLinksFromNewIPs(newIPList, user, nodeDomain, wsPath));
-                }
-                // GitHub IP只支持VLESS格式
-            }
-        } catch (error) {
-            console.error('获取GitHub IP失败:', error);
-        }
+    if (pitch) {
+      urlParams.push(`p=${pitch}`);
     }
 
-    if (finalLinks.length === 0) {
-        const errorRemark = "所有节点获取失败";
-        const errorLink = `vless://00000000-0000-0000-0000-000000000000@127.0.0.1:80?encryption=none&security=none&type=ws&host=error.com&path=%2F#${encodeURIComponent(errorRemark)}`;
-        finalLinks.push(errorLink);
+    if (style) {
+      urlParams.push(`s=${style}`);
     }
 
-    let subscriptionContent;
-    let contentType = 'text/plain; charset=utf-8';
-    
-    switch (target.toLowerCase()) {
-        case 'clash':
-        case 'clashr':
-            subscriptionContent = generateClashConfig(finalLinks);
-            contentType = 'text/yaml; charset=utf-8';
-            break;
-        case 'surge':
-        case 'surge2':
-        case 'surge3':
-        case 'surge4':
-            subscriptionContent = generateSurgeConfig(finalLinks);
-            break;
-        case 'quantumult':
-        case 'quanx':
-            subscriptionContent = generateQuantumultConfig(finalLinks);
-            break;
-        default:
-            subscriptionContent = btoa(finalLinks.join('\n'));
+    // 只有配置了API密钥且请求提供了api_key参数时才添加
+    if (API_KEY && apiKey) {
+      urlParams.push(`api_key=${apiKey}`);
     }
-    
-    return new Response(subscriptionContent, {
-        headers: { 
-            'Content-Type': contentType,
-            'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
-        },
+
+    const url = `${baseUrl}/tts?${urlParams.join('&')}`;
+
+    // 返回 reader 响应
+    return new Response(JSON.stringify({
+      id: Date.now(),
+      name: displayName,
+      url: url
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json; charset=utf-8' }
     });
-}
+  }
 
-// 生成Clash配置（简化版，返回YAML格式）
-function generateClashConfig(links) {
-    let yaml = 'port: 7890\n';
-    yaml += 'socks-port: 7891\n';
-    yaml += 'allow-lan: false\n';
-    yaml += 'mode: rule\n';
-    yaml += 'log-level: info\n\n';
-    yaml += 'proxies:\n';
-    
-    const proxyNames = [];
-    links.forEach((link, index) => {
-        const name = decodeURIComponent(link.split('#')[1] || `节点${index + 1}`);
-        proxyNames.push(name);
-        const server = link.match(/@([^:]+):(\d+)/)?.[1] || '';
-        const port = link.match(/@[^:]+:(\d+)/)?.[1] || '443';
-        const uuid = link.match(/vless:\/\/([^@]+)@/)?.[1] || '';
-        const tls = link.includes('security=tls');
-        const path = link.match(/path=([^&#]+)/)?.[1] || '/';
-        const host = link.match(/host=([^&#]+)/)?.[1] || '';
-        const sni = link.match(/sni=([^&#]+)/)?.[1] || '';
-        
-        yaml += `  - name: ${name}\n`;
-        yaml += `    type: vless\n`;
-        yaml += `    server: ${server}\n`;
-        yaml += `    port: ${port}\n`;
-        yaml += `    uuid: ${uuid}\n`;
-        yaml += `    tls: ${tls}\n`;
-        yaml += `    network: ws\n`;
-        yaml += `    ws-opts:\n`;
-        yaml += `      path: ${path}\n`;
-        yaml += `      headers:\n`;
-        yaml += `        Host: ${host}\n`;
-        if (sni) {
-            yaml += `    servername: ${sni}\n`;
+  // 添加 ifreetime.json 路径处理
+  if (path === '/ifreetime.json') {
+    // 从请求参数获取 API 密钥
+    const apiKey = requestUrl.searchParams.get('api_key');
+
+    // 验证 API 密钥
+    if (!validateApiKey(apiKey)) {
+      return new Response(JSON.stringify({
+        error: 'Unauthorized',
+        message: '无效的 API 密钥，请确保您提供了正确的密钥。',
+        status: 401
+      }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json; charset=utf-8' }
+      });
+    }
+
+    // 从URL参数获取
+    const voice = requestUrl.searchParams.get('v') || '';
+    const rate = requestUrl.searchParams.get('r') || '';
+    const pitch = requestUrl.searchParams.get('p') || '';
+    const style = requestUrl.searchParams.get('s') || '';
+    const displayName = requestUrl.searchParams.get('n') || 'Microsoft TTS';
+
+    // 构建基本URL
+    const baseUrl = `${requestUrl.protocol}//${requestUrl.host}`;
+    const url = `${baseUrl}/tts`;
+
+    // 生成随机的唯一ID
+    const ttsConfigID = crypto.randomUUID();
+
+    // 构建请求参数
+    const params = {
+      "t": "%@", // %@ 是 IFreeTime 中的文本占位符
+      "v": voice,
+      "r": rate,
+      "p": pitch,
+      "s": style
+    };
+
+    // 只有配置了API密钥且请求提供了api_key参数时才添加
+    if (API_KEY && apiKey) {
+      params["api_key"] = apiKey;
+    }
+
+    // 构建响应
+    const response = {
+      loginUrl: "",
+      maxWordCount: "",
+      customRules: {},
+      ttsConfigGroup: "Azure",
+      _TTSName: displayName,
+      _ClassName: "JxdAdvCustomTTS",
+      _TTSConfigID: ttsConfigID,
+      httpConfigs: {
+        useCookies: 1,
+        headers: {}
+      },
+      voiceList: [],
+      ttsHandles: [
+        {
+          paramsEx: "",
+          processType: 1,
+          maxPageCount: 1,
+          nextPageMethod: 1,
+          method: 1,
+          requestByWebView: 0,
+          parser: {},
+          nextPageParams: {},
+          url: url,
+          params: params,
+          httpConfigs: {
+            useCookies: 1,
+            headers: {}
+          }
         }
+      ]
+    };
+
+    // 返回 IFreeTime 响应
+    return new Response(JSON.stringify(response), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json; charset=utf-8' }
     });
-    
-    yaml += '\nproxy-groups:\n';
-    yaml += '  - name: PROXY\n';
-    yaml += '    type: select\n';
-    yaml += `    proxies: [${proxyNames.map(n => `'${n}'`).join(', ')}]\n`;
-    yaml += '\nrules:\n';
-    yaml += '  - DOMAIN-SUFFIX,local,DIRECT\n';
-    yaml += '  - IP-CIDR,127.0.0.0/8,DIRECT\n';
-    yaml += '  - GEOIP,CN,DIRECT\n';
-    yaml += '  - MATCH,PROXY\n';
-    
-    return yaml;
-}
+  }
 
-// 生成Surge配置
-function generateSurgeConfig(links) {
-    let config = '[Proxy]\n';
-    links.forEach(link => {
-        const name = decodeURIComponent(link.split('#')[1] || '节点');
-        config += `${name} = vless, ${link.match(/@([^:]+):(\d+)/)?.[1] || ''}, ${link.match(/@[^:]+:(\d+)/)?.[1] || '443'}, username=${link.match(/vless:\/\/([^@]+)@/)?.[1] || ''}, tls=${link.includes('security=tls')}, ws=true, ws-path=${link.match(/path=([^&#]+)/)?.[1] || '/'}, ws-headers=Host:${link.match(/host=([^&#]+)/)?.[1] || ''}\n`;
+  // 添加 OpenAI 兼容接口路由
+  if (path === '/v1/audio/speech' || path === '/audio/speech') {
+    return await handleOpenAITTS(request);
+  }
+
+  if(path === '/voices') {
+    const l = (requestUrl.searchParams.get('l') || '').toLowerCase();
+    const f = requestUrl.searchParams.get('f');
+    let response = await voiceList();
+
+    if(l.length > 0) {
+      response = response.filter(item => item.Locale.toLowerCase().includes(l));
+    }
+
+    return new Response(JSON.stringify(response), {
+      headers:{
+      'Content-Type': 'application/json; charset=utf-8'
+      }
     });
-    config += '\n[Proxy Group]\nPROXY = select, ' + links.map((_, i) => decodeURIComponent(links[i].split('#')[1] || `节点${i + 1}`)).join(', ') + '\n';
-    return config;
-}
+  }
 
-// 生成Quantumult配置
-function generateQuantumultConfig(links) {
-    return btoa(links.join('\n'));
-}
-
-// 生成iOS 26风格的主页
-function generateHomePage(scuValue) {
-    const scu = scuValue || 'https://url.v1.mk/sub';
-    return `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
+  const baseUrl = request.url.split('://')[0] + "://" +requestUrl.host;
+  return new Response(`
+  <!DOCTYPE html>
+  <html lang="zh-CN">
+  <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <title>服务器优选工具</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-            -webkit-tap-highlight-color: transparent;
-        }
-        
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Helvetica Neue', Arial, sans-serif;
-            background: linear-gradient(180deg, #f5f5f7 0%, #ffffff 100%);
-            color: #1d1d1f;
-            min-height: 100vh;
-            padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
-            overflow-x: hidden;
-        }
-        
-        .container {
-            max-width: 600px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-        
-        .header {
-            text-align: center;
-            padding: 40px 20px 30px;
-        }
-        
-        .header h1 {
-            font-size: 34px;
-            font-weight: 700;
-            letter-spacing: -0.5px;
-            color: #1d1d1f;
-            margin-bottom: 8px;
-        }
-        
-        .header p {
-            font-size: 17px;
-            color: #86868b;
-            font-weight: 400;
-        }
-        
-        .card {
-            background: rgba(255, 255, 255, 0.8);
-            backdrop-filter: blur(20px) saturate(180%);
-            -webkit-backdrop-filter: blur(20px) saturate(180%);
-            border-radius: 20px;
-            padding: 24px;
-            margin-bottom: 16px;
-            box-shadow: 0 2px 16px rgba(0, 0, 0, 0.08);
-            border: 0.5px solid rgba(0, 0, 0, 0.04);
-        }
-        
-        .form-group {
-            margin-bottom: 20px;
-        }
-        
-        .form-group label {
-            display: block;
-            font-size: 13px;
-            font-weight: 600;
-            color: #86868b;
-            margin-bottom: 8px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-        
-        .form-group input {
-            width: 100%;
-            padding: 14px 16px;
-            font-size: 17px;
-            font-weight: 400;
-            color: #1d1d1f;
-            background: rgba(142, 142, 147, 0.12);
-            border: none;
-            border-radius: 12px;
-            outline: none;
-            transition: all 0.2s ease;
-            -webkit-appearance: none;
-        }
-        
-        .form-group input:focus {
-            background: rgba(142, 142, 147, 0.16);
-            transform: scale(1.01);
-        }
-        
-        .form-group input::placeholder {
-            color: #86868b;
-        }
-        
-        .switch-group {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 12px 0;
-        }
-        
-        .switch-group label {
-            font-size: 17px;
-            font-weight: 400;
-            color: #1d1d1f;
-            text-transform: none;
-            letter-spacing: 0;
-        }
-        
-        .switch {
-            position: relative;
-            width: 51px;
-            height: 31px;
-            background: rgba(142, 142, 147, 0.3);
-            border-radius: 16px;
-            transition: background 0.3s ease;
-            cursor: pointer;
-        }
-        
-        .switch.active {
-            background: #34c759;
-        }
-        
-        .switch::after {
-            content: '';
-            position: absolute;
-            top: 2px;
-            left: 2px;
-            width: 27px;
-            height: 27px;
-            background: #ffffff;
-            border-radius: 50%;
-            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
-        }
-        
-        .switch.active::after {
-            transform: translateX(20px);
-        }
-        
-        .btn {
-            width: 100%;
-            padding: 16px;
-            font-size: 17px;
-            font-weight: 600;
-            color: #ffffff;
-            background: #007aff;
-            border: none;
-            border-radius: 12px;
-            cursor: pointer;
-            transition: all 0.2s ease;
-            margin-top: 8px;
-            -webkit-appearance: none;
-            box-shadow: 0 2px 8px rgba(0, 122, 255, 0.3);
-        }
-        
-        .btn:active {
-            transform: scale(0.98);
-            opacity: 0.8;
-        }
-        
-        .btn-secondary {
-            background: rgba(142, 142, 147, 0.12);
-            color: #007aff;
-            box-shadow: none;
-        }
-        
-        .btn-secondary:active {
-            background: rgba(142, 142, 147, 0.2);
-        }
-        
-        .result {
-            margin-top: 20px;
-            padding: 16px;
-            background: rgba(142, 142, 147, 0.12);
-            border-radius: 12px;
-            font-size: 15px;
-            color: #1d1d1f;
-            word-break: break-all;
-            display: none;
-        }
-        
-        .result.show {
-            display: block;
-        }
-        
-        .result-url {
-            margin-top: 12px;
-            padding: 12px;
-            background: rgba(0, 122, 255, 0.1);
-            border-radius: 8px;
-            font-size: 13px;
-            color: #007aff;
-            word-break: break-all;
-        }
-        
-        .copy-btn {
-            margin-top: 8px;
-            padding: 10px 16px;
-            font-size: 15px;
-            background: rgba(0, 122, 255, 0.1);
-            color: #007aff;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-        }
-        
-        .client-btn {
-            padding: 12px 10px;
-            font-size: 14px;
-            font-weight: 500;
-            color: #007aff;
-            background: rgba(0, 122, 255, 0.1);
-            border: 1px solid rgba(0, 122, 255, 0.2);
-            border-radius: 10px;
-            cursor: pointer;
-            transition: all 0.2s ease;
-            -webkit-appearance: none;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            min-width: 0;
-        }
-        
-        .client-btn:active {
-            transform: scale(0.98);
-            background: rgba(0, 122, 255, 0.2);
-        }
-        
-        .checkbox-label {
-            display: flex;
-            align-items: center;
-            cursor: pointer;
-            font-size: 17px;
-            font-weight: 400;
-            user-select: none;
-            -webkit-user-select: none;
-            position: relative;
-            z-index: 1;
-        }
-        
-        .checkbox-label input[type="checkbox"] {
-            margin-right: 8px;
-            width: 20px;
-            height: 20px;
-            cursor: pointer;
-            flex-shrink: 0;
-            position: relative;
-            z-index: 2;
-            -webkit-appearance: checkbox;
-            appearance: checkbox;
-        }
-        
-        .checkbox-label span {
-            cursor: pointer;
-            position: relative;
-            z-index: 1;
-        }
-        
-        @media (max-width: 480px) {
-            .client-btn {
-                font-size: 12px;
-                padding: 10px 8px;
-            }
-        }
-        
-        .footer {
-            text-align: center;
-            padding: 30px 20px;
-            color: #86868b;
-            font-size: 13px;
-        }
-        
-        .footer a {
-            transition: opacity 0.2s ease;
-        }
-        
-        .footer a:active {
-            opacity: 0.6;
-        }
-        
-        @media (prefers-color-scheme: dark) {
-            body {
-                background: linear-gradient(180deg, #000000 0%, #1c1c1e 100%);
-                color: #f5f5f7;
-            }
-            
-            .card {
-                background: rgba(28, 28, 30, 0.8);
-                border: 0.5px solid rgba(255, 255, 255, 0.1);
-            }
-            
-            .form-group input {
-                background: rgba(142, 142, 147, 0.2);
-                color: #f5f5f7;
-            }
-            
-            .form-group input:focus {
-                background: rgba(142, 142, 147, 0.25);
-            }
-            
-            .switch-group label {
-                color: #f5f5f7;
-            }
-            
-            .result {
-                background: rgba(142, 142, 147, 0.2);
-                color: #f5f5f7;
-            }
-            
-            select {
-                background: rgba(142, 142, 147, 0.2) !important;
-                color: #f5f5f7 !important;
-            }
-            
-            label span {
-                color: #f5f5f7;
-            }
-            
-            .client-btn {
-                background: rgba(0, 122, 255, 0.15) !important;
-                border-color: rgba(0, 122, 255, 0.3) !important;
-                color: #5ac8fa !important;
-            }
-            
-            .footer a {
-                color: #5ac8fa !important;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>服务器优选工具</h1>
-            <p>智能优选 • 一键生成</p>
-        </div>
-        
-        <div class="card">
-            <div class="form-group">
-                <label>域名</label>
-                <input type="text" id="domain" placeholder="请输入您的域名">
-            </div>
-            
-            <div class="form-group">
-                <label>UUID</label>
-                <input type="text" id="uuid" placeholder="请输入UUID">
-            </div>
-            
-            <div class="form-group">
-                <label>WebSocket路径（可选）</label>
-                <input type="text" id="customPath" placeholder="留空则使用默认路径 /" value="/">
-                <small style="display: block; margin-top: 6px; color: #86868b; font-size: 13px;">自定义WebSocket路径，例如：/v2ray 或 /</small>
-            </div>
-            
-            <div class="switch-group">
-                <label>启用优选域名</label>
-                <div class="switch active" id="switchDomain" onclick="toggleSwitch('switchDomain')"></div>
-            </div>
-            
-            <div class="switch-group">
-                <label>启用优选IP</label>
-                <div class="switch active" id="switchIP" onclick="toggleSwitch('switchIP')"></div>
-            </div>
-            
-            <div class="switch-group">
-                <label>启用GitHub优选</label>
-                <div class="switch active" id="switchGitHub" onclick="toggleSwitch('switchGitHub')"></div>
-            </div>
-            
-            <div class="form-group" id="githubUrlGroup" style="margin-top: 12px;">
-                <label>GitHub优选URL（可选）</label>
-                <input type="text" id="githubUrl" placeholder="留空则使用默认地址" style="font-size: 15px;">
-                <small style="display: block; margin-top: 6px; color: #86868b; font-size: 13px;">自定义优选IP列表来源URL，留空则使用默认地址</small>
-            </div>
-            
-            <div class="form-group" style="margin-top: 24px;">
-                <label>协议选择</label>
-                <div style="display: flex; flex-direction: column; gap: 12px; margin-top: 8px;">
-                    <div class="switch-group">
-                        <label>VLESS (vl)</label>
-                        <div class="switch active" id="switchVL" onclick="toggleSwitch('switchVL')"></div>
-                    </div>
-                    <div class="switch-group">
-                        <label>Trojan (tj)</label>
-                        <div class="switch" id="switchTJ" onclick="toggleSwitch('switchTJ')"></div>
-                    </div>
-                    <div class="switch-group">
-                        <label>VMess (vm)</label>
-                        <div class="switch" id="switchVM" onclick="toggleSwitch('switchVM')"></div>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="form-group" style="margin-top: 24px;">
-                <label>客户端选择</label>
-                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin-top: 8px;">
-                    <button type="button" class="client-btn" onclick="generateClientLink('clash', 'CLASH')">CLASH</button>
-                    <button type="button" class="client-btn" onclick="generateClientLink('clash', 'STASH')">STASH</button>
-                    <button type="button" class="client-btn" onclick="generateClientLink('surge', 'SURGE')">SURGE</button>
-                    <button type="button" class="client-btn" onclick="generateClientLink('sing-box', 'SING-BOX')">SING-BOX</button>
-                    <button type="button" class="client-btn" onclick="generateClientLink('loon', 'LOON')">LOON</button>
-                    <button type="button" class="client-btn" onclick="generateClientLink('quanx', 'QUANTUMULT X')" style="font-size: 13px;">QUANTUMULT X</button>
-                    <button type="button" class="client-btn" onclick="generateClientLink('v2ray', 'V2RAY')">V2RAY</button>
-                    <button type="button" class="client-btn" onclick="generateClientLink('v2ray', 'V2RAYNG')">V2RAYNG</button>
-                    <button type="button" class="client-btn" onclick="generateClientLink('v2ray', 'NEKORAY')">NEKORAY</button>
-                    <button type="button" class="client-btn" onclick="generateClientLink('v2ray', 'Shadowrocket')" style="font-size: 13px;">Shadowrocket</button>
-                </div>
-                <div class="result-url" id="clientSubscriptionUrl" style="display: none; margin-top: 12px; padding: 12px; background: rgba(0, 122, 255, 0.1); border-radius: 8px; font-size: 13px; color: #007aff; word-break: break-all;"></div>
-            </div>
-            
-            <div class="form-group">
-                <label>IP版本选择</label>
-                <div style="display: flex; gap: 16px; margin-top: 8px;">
-                    <label class="checkbox-label">
-                        <input type="checkbox" id="ipv4Enabled" checked>
-                        <span>IPv4</span>
-                    </label>
-                    <label class="checkbox-label">
-                        <input type="checkbox" id="ipv6Enabled" checked>
-                        <span>IPv6</span>
-                    </label>
-                </div>
-            </div>
-            
-            <div class="form-group">
-                <label>运营商选择</label>
-                <div style="display: flex; gap: 16px; flex-wrap: wrap; margin-top: 8px;">
-                    <label class="checkbox-label">
-                        <input type="checkbox" id="ispMobile" checked>
-                        <span>移动</span>
-                    </label>
-                    <label class="checkbox-label">
-                        <input type="checkbox" id="ispUnicom" checked>
-                        <span>联通</span>
-                    </label>
-                    <label class="checkbox-label">
-                        <input type="checkbox" id="ispTelecom" checked>
-                        <span>电信</span>
-                    </label>
-                </div>
-            </div>
-            
-            <div class="switch-group" style="margin-top: 20px;">
-                <label>仅TLS节点</label>
-                <div class="switch" id="switchTLS" onclick="toggleSwitch('switchTLS')"></div>
-            </div>
-            <small style="display: block; margin-top: -12px; margin-bottom: 12px; color: #86868b; font-size: 13px; padding-left: 0;">启用后只生成带TLS的节点，不生成非TLS节点（如80端口）</small>
-        </div>
-        
-        <div class="footer">
-            <p>简化版优选工具 • 仅用于节点生成</p>
-            <div style="margin-top: 20px; display: flex; justify-content: center; gap: 24px; flex-wrap: wrap;">
-                <a href="https://github.com/byJoey/cfnew" target="_blank" style="color: #007aff; text-decoration: none; font-size: 15px; font-weight: 500;">GitHub 项目</a>
-                <a href="https://www.youtube.com/@joeyblog" target="_blank" style="color: #007aff; text-decoration: none; font-size: 15px; font-weight: 500;">YouTube @joeyblog</a>
-            </div>
-        </div>
-    </div>
-    
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Microsoft TTS API</title>
+    <script src="https://cdn.tailwindcss.com"></script>
     <script>
-        let switches = {
-            switchDomain: true,
-            switchIP: true,
-            switchGitHub: true,
-            switchVL: true,
-            switchTJ: false,
-            switchVM: false,
-            switchTLS: false
-        };
-        
-        function toggleSwitch(id) {
-            const switchEl = document.getElementById(id);
-            switches[id] = !switches[id];
-            switchEl.classList.toggle('active');
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              'ms-blue': '#0078d4',
+              'ms-dark-blue': '#005a9e',
+            }
+          }
         }
-        
-        
-        // 订阅转换地址（从服务器注入）
-        const SUB_CONVERTER_URL = "${ scu }";
-        
-        function tryOpenApp(schemeUrl, fallbackCallback, timeout) {
-            timeout = timeout || 2500;
-            let appOpened = false;
-            let callbackExecuted = false;
-            const startTime = Date.now();
-            
-            const blurHandler = () => {
-                const elapsed = Date.now() - startTime;
-                if (elapsed < 3000 && !callbackExecuted) {
-                    appOpened = true;
-                }
-            };
-            
-            window.addEventListener('blur', blurHandler);
-            
-            const hiddenHandler = () => {
-                const elapsed = Date.now() - startTime;
-                if (elapsed < 3000 && !callbackExecuted) {
-                    appOpened = true;
-                }
-            };
-            
-            document.addEventListener('visibilitychange', hiddenHandler);
-            
-            const iframe = document.createElement('iframe');
-            iframe.style.display = 'none';
-            iframe.style.width = '1px';
-            iframe.style.height = '1px';
-            iframe.src = schemeUrl;
-            document.body.appendChild(iframe);
-            
-            setTimeout(() => {
-                if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
-                window.removeEventListener('blur', blurHandler);
-                document.removeEventListener('visibilitychange', hiddenHandler);
-                
-                if (!callbackExecuted) {
-                    callbackExecuted = true;
-                    if (!appOpened && fallbackCallback) {
-                        fallbackCallback();
-                    }
-                }
-            }, timeout);
-        }
-        
-        function generateClientLink(clientType, clientName) {
-            const domain = document.getElementById('domain').value.trim();
-            const uuid = document.getElementById('uuid').value.trim();
-            const customPath = document.getElementById('customPath').value.trim() || '/';
-            
-            if (!domain || !uuid) {
-                alert('请先填写域名和UUID');
-                return;
-            }
-            
-            if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(uuid)) {
-                alert('UUID格式不正确');
-                return;
-            }
-            
-            // 检查至少选择一个协议
-            if (!switches.switchVL && !switches.switchTJ && !switches.switchVM) {
-                alert('请至少选择一个协议（VLESS、Trojan或VMess）');
-                return;
-            }
-            
-            const ipv4Enabled = document.getElementById('ipv4Enabled').checked;
-            const ipv6Enabled = document.getElementById('ipv6Enabled').checked;
-            const ispMobile = document.getElementById('ispMobile').checked;
-            const ispUnicom = document.getElementById('ispUnicom').checked;
-            const ispTelecom = document.getElementById('ispTelecom').checked;
-            
-            const githubUrl = document.getElementById('githubUrl').value.trim();
-            
-            const currentUrl = new URL(window.location.href);
-            const baseUrl = currentUrl.origin;
-            let subscriptionUrl = \`\${baseUrl}/\${uuid}/sub?domain=\${encodeURIComponent(domain)}&epd=\${switches.switchDomain ? 'yes' : 'no'}&epi=\${switches.switchIP ? 'yes' : 'no'}&egi=\${switches.switchGitHub ? 'yes' : 'no'}\`;
-            
-            // 添加GitHub优选URL
-            if (githubUrl) {
-                subscriptionUrl += \`&piu=\${encodeURIComponent(githubUrl)}\`;
-            }
-            
-            // 添加协议选择
-            if (switches.switchVL) subscriptionUrl += '&ev=yes';
-            if (switches.switchTJ) subscriptionUrl += '&et=yes';
-            if (switches.switchVM) subscriptionUrl += '&vm=yes';
-            
-            if (!ipv4Enabled) subscriptionUrl += '&ipv4=no';
-            if (!ipv6Enabled) subscriptionUrl += '&ipv6=no';
-            if (!ispMobile) subscriptionUrl += '&ispMobile=no';
-            if (!ispUnicom) subscriptionUrl += '&ispUnicom=no';
-            if (!ispTelecom) subscriptionUrl += '&ispTelecom=no';
-            
-            // 添加TLS控制
-            if (switches.switchTLS) subscriptionUrl += '&dkby=yes';
-            
-            // 添加自定义路径
-            if (customPath && customPath !== '/') {
-                subscriptionUrl += \`&path=\${encodeURIComponent(customPath)}\`;
-            }
-            
-            let finalUrl = subscriptionUrl;
-            let schemeUrl = '';
-            let displayName = clientName || '';
-            
-            if (clientType === 'v2ray') {
-                finalUrl = subscriptionUrl;
-                const urlElement = document.getElementById('clientSubscriptionUrl');
-                urlElement.textContent = finalUrl;
-                urlElement.style.display = 'block';
-                
-                if (clientName === 'V2RAY') {
-                    navigator.clipboard.writeText(finalUrl).then(() => {
-                        alert(displayName + ' 订阅链接已复制');
-                    });
-                } else if (clientName === 'Shadowrocket') {
-                    schemeUrl = 'shadowrocket://add/' + encodeURIComponent(finalUrl);
-                    tryOpenApp(schemeUrl, () => {
-                        navigator.clipboard.writeText(finalUrl).then(() => {
-                            alert(displayName + ' 订阅链接已复制');
-                        });
-                    });
-                } else if (clientName === 'V2RAYNG') {
-                    schemeUrl = 'v2rayng://install?url=' + encodeURIComponent(finalUrl);
-                    tryOpenApp(schemeUrl, () => {
-                        navigator.clipboard.writeText(finalUrl).then(() => {
-                            alert(displayName + ' 订阅链接已复制');
-                        });
-                    });
-                } else if (clientName === 'NEKORAY') {
-                    schemeUrl = 'nekoray://install-config?url=' + encodeURIComponent(finalUrl);
-                    tryOpenApp(schemeUrl, () => {
-                        navigator.clipboard.writeText(finalUrl).then(() => {
-                            alert(displayName + ' 订阅链接已复制');
-                        });
-                    });
-                }
-            } else {
-                const encodedUrl = encodeURIComponent(subscriptionUrl);
-                finalUrl = SUB_CONVERTER_URL + '?target=' + clientType + '&url=' + encodedUrl + '&insert=false&emoji=true&list=false&xudp=false&udp=false&tfo=false&expand=true&scv=false&fdn=false&new_name=true';
-                
-                const urlElement = document.getElementById('clientSubscriptionUrl');
-                urlElement.textContent = finalUrl;
-                urlElement.style.display = 'block';
-                
-                if (clientType === 'clash') {
-                    if (clientName === 'STASH') {
-                        schemeUrl = 'stash://install?url=' + encodeURIComponent(finalUrl);
-                        displayName = 'STASH';
-                    } else {
-                        schemeUrl = 'clash://install-config?url=' + encodeURIComponent(finalUrl);
-                        displayName = 'CLASH';
-                    }
-                } else if (clientType === 'surge') {
-                    schemeUrl = 'surge:///install-config?url=' + encodeURIComponent(finalUrl);
-                    displayName = 'SURGE';
-                } else if (clientType === 'sing-box') {
-                    schemeUrl = 'sing-box://install-config?url=' + encodeURIComponent(finalUrl);
-                    displayName = 'SING-BOX';
-                } else if (clientType === 'loon') {
-                    schemeUrl = 'loon://install?url=' + encodeURIComponent(finalUrl);
-                    displayName = 'LOON';
-                } else if (clientType === 'quanx') {
-                    schemeUrl = 'quantumult-x://install-config?url=' + encodeURIComponent(finalUrl);
-                    displayName = 'QUANTUMULT X';
-                }
-                
-                if (schemeUrl) {
-                    tryOpenApp(schemeUrl, () => {
-                        navigator.clipboard.writeText(finalUrl).then(() => {
-                            alert(displayName + ' 订阅链接已复制');
-                        });
-                    });
-                } else {
-                    navigator.clipboard.writeText(finalUrl).then(() => {
-                        alert(displayName + ' 订阅链接已复制');
-                    });
-                }
-            }
-        }
+      }
     </script>
-</body>
-</html>`;
+  </head>
+  <body class="bg-gray-50 text-gray-800">
+    <!-- 导航栏 -->
+    <nav class="bg-ms-blue shadow-2xl">
+      <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div class="flex justify-between h-16">
+          <div class="flex items-center">
+            <svg class="w-8 h-8 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+            </svg>
+            <span class="ml-2 font-bold text-white text-xl">Microsoft TTS API</span>
+          </div>
+        </div>
+      </div>
+    </nav>
+
+    <!-- 主内容 -->
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
+      <div class="flex flex-col lg:flex-row gap-8">
+        <!-- 语音转换 -->
+        <div class="lg:w-3/4 mx-auto">
+          <div class="bg-white overflow-hidden shadow rounded-lg divide-y divide-gray-200">
+            <div class="px-4 py-5 sm:px-6">
+              <h2 class="text-lg font-medium text-gray-900">在线文本转语音</h2>
+              <p class="mt-1 text-sm text-gray-500">输入文本并选择语音进行转换</p>
+            </div>
+            <div class="px-4 py-5 sm:p-6">
+              <form id="ttsForm" class="space-y-6">
+                <!-- 添加错误提示区域 -->
+                <div id="apiErrorAlert" class="rounded-md bg-red-50 p-4" style="display: none;">
+                  <div class="flex">
+                    <div class="ml-3">
+                      <h3 class="text-sm font-medium text-red-800" id="apiErrorTitle">错误</h3>
+                      <div class="mt-2 text-sm text-red-700">
+                        <p id="apiErrorMessage"></p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div>
+                  <label for="apiKey" class="block text-sm font-medium text-gray-700">API Key</label>
+                  <div class="mt-1 flex rounded-md shadow-sm">
+                    <div id="apiKeyInputGroup" class="flex-grow flex relative">
+                      <input type="password" id="apiKey" name="apiKey" required
+                        class="block w-full shadow-sm sm:text-sm border-gray-300 rounded-md focus:ring-ms-blue focus:border-ms-blue"
+                        placeholder="输入API Key" />
+                      <button type="button" id="toggleApiKeyVisibility" class="absolute inset-y-0 right-0 px-3 flex items-center">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 06 0z" />
+                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                        </svg>
+                      </button>
+                    </div>
+                    <button type="button" id="saveApiKey" class="ml-2 inline-flex items-center px-3 py-2 border border-gray-300 shadow-sm text-sm leading-4 font-medium rounded-md text-white bg-ms-blue hover:bg-ms-dark-blue focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ms-blue">
+                      保存
+                    </button>
+                  </div>
+                  <div id="savedApiKeyInfo" style="display:none;" class="mt-2 flex items-center justify-between">
+                    <span class="text-sm text-green-600 flex items-center">
+                      API Key 已保存
+                    </span>
+                    <button type="button" id="editApiKey" class="text-sm text-ms-blue hover:text-ms-dark-blue">
+                      编辑
+                    </button>
+                  </div>
+                </div>
+
+                <div>
+                  <label for="text" class="block text-sm font-medium text-gray-700">输入文本</label>
+                  <textarea id="text" name="text" rows="4" required
+                    class="mt-1 block w-full shadow-sm sm:text-sm border-gray-300 rounded-md focus:ring-ms-blue focus:border-ms-blue"
+                    placeholder="请输入要转换的文本"></textarea>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div>
+                    <label for="voice" class="block text-sm font-medium text-gray-700">选择语音</label>
+                    <select id="voice" name="voice"
+                      class="mt-1 block w-full py-2 px-3 border border-gray-300 bg-white rounded-md shadow-sm focus:outline-none focus:ring-ms-blue focus:border-ms-blue sm:text-sm">
+                    </select>
+                  </div>
+
+                  <div>
+                    <label for="style" class="block text-sm font-medium text-gray-700">语音风格</label>
+                    <select id="style" name="style"
+                      class="mt-1 block w-full py-2 px-3 border border-gray-300 bg-white rounded-md shadow-sm focus:outline-none focus:ring-ms-blue focus:border-ms-blue sm:text-sm">
+                      <option value="general" selected>标准</option>
+                      <option value="advertisement_upbeat">广告热情</option>
+                      <option value="affectionate">亲切</option>
+                      <option value="angry">愤怒</option>
+                      <option value="assistant">助理</option>
+                      <option value="calm">平静</option>
+                      <option value="chat">随意</option>
+                      <option value="cheerful">愉快</option>
+                      <option value="customerservice">客服</option>
+                      <option value="depressed">沮丧</option>
+                      <option value="disgruntled">不满</option>
+                      <option value="documentary-narration">纪录片解说</option>
+                      <option value="embarrassed">尴尬</option>
+                      <option value="empathetic">共情</option>
+                      <option value="envious">羡慕</option>
+                      <option value="excited">兴奋</option>
+                      <option value="fearful">恐惧</option>
+                      <option value="friendly">友好</option>
+                      <option value="gentle">温柔</option>
+                      <option value="hopeful">希望</option>
+                      <option value="lyrical">抒情</option>
+                      <option value="narration-professional">专业叙述</option>
+                      <option value="narration-relaxed">轻松叙述</option>
+                      <option value="newscast">新闻播报</option>
+                      <option value="newscast-casual">随意新闻</option>
+                      <option value="newscast-formal">正式新闻</option>
+                      <option value="poetry-reading">诗朗诵</option>
+                      <option value="sad">悲伤</option>
+                      <option value="serious">严肃</option>
+                      <option value="shouting">大喊</option>
+                      <option value="sports_commentary">体育解说</option>
+                      <option value="sports_commentary_excited">激动体育解说</option>
+                      <option value="whispering">低语</option>
+                      <option value="terrified">恐慌</option>
+                      <option value="unfriendly">冷漠</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div>
+                    <label for="rate" class="block text-sm font-medium text-gray-700">语速调整</label>
+                    <div class="flex items-center mt-2">
+                      <span id="rateValue" class="w-8 text-sm text-gray-500">0</span>
+                      <input type="range" id="rate" name="rate" min="-100" max="100" value="0"
+                        class="mt-1 block w-full" oninput="document.getElementById('rateValue').textContent=this.value" />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label for="pitch" class="block text-sm font-medium text-gray-700">音调调整</label>
+                    <div class="flex items-center mt-2">
+                      <span id="pitchValue" class="w-8 text-sm text-gray-500">0</span>
+                      <input type="range" id="pitch" name="pitch" min="-100" max="100" value="0"
+                        class="mt-1 block w-full" oninput="document.getElementById('pitchValue').textContent=this.value" />
+                    </div>
+                  </div>
+                </div>
+
+                <div class="flex flex-col sm:flex-row gap-3">
+                  <button type="submit"
+                    class="inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-ms-blue hover:bg-ms-dark-blue focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ms-blue">
+                    生成语音
+                  </button>
+                  <button type="button" id="downloadBtn" style="display:none;"
+                    class="inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-green-600 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500">
+                    下载音频
+                  </button>
+                  <button type="button" id="getReaderLinkBtn"
+                    class="inline-flex justify-center py-2 px-4 border border-gray-300 shadow-sm text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ms-blue">
+                    导入阅读
+                  </button>
+                  <button type="button" id="getIFreeTimeLinkBtn"
+                    class="inline-flex justify-center py-2 px-4 border border-gray-300 shadow-sm text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ms-blue">
+                    导入爱阅记
+                  </button>
+                </div>
+
+                <div id="voiceLoadError" role="alert" class="mt-4 rounded-md bg-red-50 p-4" style="display: none;">
+                  <div class="flex">
+                    <div class="flex-shrink-0">
+                      <svg class="h-5 w-5 text-red-400" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                        <path fill-rule="evenodd" d="M10 18a8 8 100-16 8 8 000 16zM8.707 7.293a1 1 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 101.414 1.414L10 11.414l1.293-1.293a1 1 001.414-1.414L11.414 10l1.293-1.293a1 1 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd" />
+                    </div>
+                    <div class="ml-3">
+                      <h3 class="text-sm font-medium text-red-800">无法加载语音列表</h3>
+                      <div class="mt-2 text-sm text-red-700">
+                        <p>显示默认语音列表。请检查网络连接或稍后再试。</p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </form>
+
+              <div id="audioContainer" class="mt-6 rounded-md bg-gray-50 p-4 border border-gray-200" style="display: none;">
+                <audio id="audioPlayer" controls class="w-full"></audio>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- 页脚 -->
+    <footer class="bg-gray-100 border-t border-gray-200">
+      <div class="max-w-7xl mx-auto py-6 px-4 sm:px-6 lg:px-8">
+        <div class="flex justify-center items-center">
+          <p class="text-gray-500 text-sm">&copy; ${new Date().getFullYear()}  TTS
+            <a href="https://github.com/zuoban/tts" target="_blank" rel="noopener noreferrer" 
+               class="inline-flex items-center text-gray-500 hover:text-gray-700 text-sm">
+              <svg class="w-5 h-5 mr-2" fill="currentColor" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg">
+                <path fill-rule="evenodd" d="M10 0C4.477 0 0 4.484 0 10.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0110 4.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.203 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.942.359.31.678.921.678 1.856 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0020 10.017C20 4.484 15.522 0 10 0z" clip-rule="evenodd"></path>
+              </svg>
+            </a>
+          </p>
+        </div>
+      </div>
+    </footer>
+
+    <script>
+      // 存储所有语音数据
+      let allVoices = [];
+
+      // 在表单提交事件监听器之前添加语音选择变更事件监听
+      document.addEventListener('DOMContentLoaded', function() {
+        // 添加对语音选择变化的监听
+        document.getElementById('voice').addEventListener('change', function() {
+          updateStyleOptions(this.value);
+        });
+
+        // 添加获取Reader链接按钮的事件监听
+        document.getElementById('getReaderLinkBtn').addEventListener('click', function() {
+          const apiKey = document.getElementById('apiKey').value || localStorage.getItem('tts_api_key') || '';
+          const voice = document.getElementById('voice').value;
+          const rate = document.getElementById('rate').value;
+          const pitch = document.getElementById('pitch').value;
+          const style = document.getElementById('style').value;
+          const displayName = document.getElementById('voice').options[document.getElementById('voice').selectedIndex].text || '微软TTS';
+
+          // 保存当前设置到localStorage
+          saveFormValuesToLocalStorage(voice, rate, pitch, style, document.getElementById('text').value);
+
+          // 构建URL参数
+          const params = new URLSearchParams();
+          if (apiKey) params.append('api_key', apiKey);
+          if (voice) params.append('v', voice);
+          if (rate) params.append('r', rate);
+          if (pitch) params.append('p', pitch);
+          if (style) params.append('s', style);
+          params.append('n', displayName);
+
+          // 打开新标签页
+          window.open(\`\${window.location.origin}/reader.json?\${params.toString()}\`, '_blank');
+        });
+
+        // 添加获取IFreeTime链接按钮的事件监听
+        document.getElementById('getIFreeTimeLinkBtn').addEventListener('click', function() {
+          const apiKey = document.getElementById('apiKey').value || localStorage.getItem('tts_api_key') || '';
+          const voice = document.getElementById('voice').value;
+          const rate = document.getElementById('rate').value;
+          const pitch = document.getElementById('pitch').value;
+          const style = document.getElementById('style').value;
+          const displayName = document.getElementById('voice').options[document.getElementById('voice').selectedIndex].text || '微软TTS';
+
+          // 保存当前设置到localStorage
+          saveFormValuesToLocalStorage(voice, rate, pitch, style, document.getElementById('text').value);
+
+          // 构建URL参数
+          const params = new URLSearchParams();
+          if (apiKey) params.append('api_key', apiKey);
+          if (voice) params.append('v', voice);
+          if (rate) params.append('r', rate);
+          if (pitch) params.append('p', pitch);
+          if (style) params.append('s', style);
+          params.append('n', displayName);
+
+          // 打开新标签页
+          window.open(\`\${window.location.origin}/ifreetime.json?\${params.toString()}\`, '_blank');
+        });
+      });
+
+      document.getElementById('ttsForm').addEventListener('submit', async function(e) {
+        e.preventDefault();
+
+        // 隐藏先前的错误信息
+        document.getElementById('apiErrorAlert').style.display = 'none';
+
+        // 获取API Key (从输入框或localStorage)
+        const apiKey = document.getElementById('apiKey').value || localStorage.getItem('tts_api_key') || '';
+        const text = encodeURIComponent(document.getElementById('text').value);
+        const voice = document.getElementById('voice').value;
+        const rate = document.getElementById('rate').value;
+        const pitch = document.getElementById('pitch').value;
+        const style = document.getElementById('style').value; // 获取选择的风格
+
+        // 保存表单值到localStorage
+        saveFormValuesToLocalStorage(voice, rate, pitch, style, document.getElementById('text').value);
+
+        if (!text) {
+          showError('请输入要转换的文本', '文本内容不能为空');
+          return;
+        }
+
+        if (!apiKey) {
+          showError('请输入API Key', 'API密钥不能为空');
+          return;
+        }
+
+        const url = \`${baseUrl}/tts?api_key=\${apiKey}&t=\${text}&v=\${voice}&r=\${rate}&p=\${pitch}&s=\${style}\`;
+
+        try {
+          const response = await fetch(url);
+
+          if (!response.ok) {
+            // 处理错误响应
+            if (response.status === 401) {
+              try {
+                const errorData = await response.json();
+                showError('认证失败', errorData.message || '无效的API密钥，请确保您提供了正确的密钥');
+              } catch (e) {
+                showError('认证失败', '无效的API密钥，请确保您提供了正确的密钥');
+              }
+              return;
+            } else {
+              showError('请求失败');
+              return;
+            }
+          }
+
+          const audioPlayer = document.getElementById('audioPlayer');
+          audioPlayer.src = url;
+          audioPlayer.play();
+
+          document.getElementById('audioContainer').style.display = 'block';
+          document.getElementById('downloadBtn').style.display = 'inline-block';
+
+          document.getElementById('downloadBtn').onclick = function() {
+            const downloadUrl = url + '&d=true';
+            window.location.href = downloadUrl;
+          };
+        } catch (error) {
+          showError('生成音频失败', error.message);
+        }
+      });
+
+      // 保存表单值到localStorage的函数
+      function saveFormValuesToLocalStorage(voice, rate, pitch, style, text) {
+        localStorage.setItem('tts_voice', voice);
+        localStorage.setItem('tts_rate', rate);
+        localStorage.setItem('tts_pitch', pitch);
+        localStorage.setItem('tts_style', style);
+        localStorage.setItem('tts_text', text);
+      }
+
+      // 从localStorage加载表单值的函数
+      function loadFormValuesFromLocalStorage() {
+        const voice = localStorage.getItem('tts_voice');
+        const rate = localStorage.getItem('tts_rate');
+        const pitch = localStorage.getItem('tts_pitch');
+        const style = localStorage.getItem('tts_style');
+        const text = localStorage.getItem('tts_text');
+
+        // 设置语音选择（在语音列表加载完成后设置）
+        if (voice) {
+          const voiceSelect = document.getElementById('voice');
+          // 我们将在语音列表加载完成后设置这个值
+          voiceSelect.dataset.savedValue = voice;
+        }
+
+        // 设置语速
+        if (rate) {
+          const rateInput = document.getElementById('rate');
+          rateInput.value = rate;
+          document.getElementById('rateValue').textContent = rate;
+        }
+
+        // 设置音调
+        if (pitch) {
+          const pitchInput = document.getElementById('pitch');
+          pitchInput.value = pitch;
+          document.getElementById('pitchValue').textContent = pitch;
+        }
+
+        // 设置文本（如果有）
+        if (text) {
+          document.getElementById('text').value = text;
+        }
+
+        // 风格将在语音选择后设置
+      }
+
+      // 显示错误信息的函数
+      function showError(title, message) {
+        const errorAlert = document.getElementById('apiErrorAlert');
+        document.getElementById('apiErrorTitle').textContent = title;
+        document.getElementById('apiErrorMessage').textContent = message;
+        errorAlert.style.display = 'block';
+
+        // 滚动到错误信息
+        errorAlert.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+
+      // 更新风格选项的函数
+      function updateStyleOptions(voiceName) {
+        const styleSelect = document.getElementById('style');
+        // 清空现有选项
+        styleSelect.innerHTML = '';
+
+        // 默认添加标准风格
+        const defaultOption = document.createElement('option');
+        defaultOption.value = 'general';
+        defaultOption.text = '标准';
+        styleSelect.appendChild(defaultOption);
+
+        // 查找选定的语音对象
+        const selectedVoice = allVoices.find(v => v.ShortName === voiceName);
+
+        if (selectedVoice && selectedVoice.StyleList && selectedVoice.StyleList.length > 0) {
+          // 对风格列表进行排序
+          const styles = [...selectedVoice.StyleList].sort();
+
+          // 为每个风格创建选项
+          styles.forEach(style => {
+            // 跳过已经添加的"general"
+            if (style.toLowerCase() === 'general') return;
+
+            const option = document.createElement('option');
+            option.value = style;
+            // 根据风格名称进行本地化显示
+            option.text = getStyleDisplayName(style);
+            styleSelect.appendChild(option);
+          });
+        }
+
+        // 添加风格选择变化事件监听器
+        styleSelect.addEventListener('change', function() {
+          localStorage.setItem('tts_style', this.value);
+        });
+      }
+
+      // 风格名称本地化显示
+      function getStyleDisplayName(styleName) {
+        const styleMap = {
+          'angry': '愤怒',
+          'cheerful': '欢快',
+          'sad': '悲伤',
+          'fearful': '恐惧',
+          'disgruntled': '不满',
+          'serious': '严肃',
+          'affectionate': '深情',
+          'gentle': '温柔',
+          'embarrassed': '尴尬',
+          'assistant': '助手',
+          'calm': '平静',
+          'chat': '聊天',
+          'excited': '兴奋',
+          'friendly': '友好',
+          'hopeful': '希望',
+          'narration-professional': '专业叙述',
+          'newscast': '新闻播报',
+          'newscast-casual': '随性新闻',
+          'poetry-reading': '诗歌朗诵',
+          'shouting': '喊叫',
+          'sports-commentary': '体育解说',
+          'whispering': '低语'
+        };
+
+        return styleMap[styleName.toLowerCase()] || styleName;
+      }
+
+      // 加载可用语音列表
+      async function loadVoices() {
+        try {
+          const response = await fetch('${baseUrl}/voices');
+          if (response.ok) {
+            allVoices = await response.json();
+
+            // 按语言对语音分组并排序
+            const zhVoices = allVoices.filter(voice => voice.Locale.startsWith('zh-'));
+            const enVoices = allVoices.filter(voice => voice.Locale.startsWith('en-'));
+            const jaVoices = allVoices.filter(voice => voice.Locale.startsWith('ja-'));
+
+            // 其他所有语言
+            const otherVoices = allVoices.filter(voice =>
+              !voice.Locale.startsWith('zh-') &&
+              !voice.Locale.startsWith('en-') &&
+              !voice.Locale.startsWith('ja-')
+            );
+
+            // 清空语音选择下拉框
+            const voiceSelect = document.getElementById('voice');
+            voiceSelect.innerHTML = '';
+
+            // 添加中文语音组
+            if(zhVoices.length > 0) {
+              addVoiceGroup(voiceSelect, '中文 (Chinese)', zhVoices);
+            }
+
+            // 添加英文语音组
+            if(enVoices.length > 0) {
+              addVoiceGroup(voiceSelect, '英文 (English)', enVoices);
+            }
+
+            // 添加日文语音组
+            if(jaVoices.length > 0) {
+              addVoiceGroup(voiceSelect, '日文 (Japanese)', jaVoices);
+            }
+
+            // 添加其他语音组
+            if(otherVoices.length > 0) {
+              addVoiceGroup(voiceSelect, '其他语言 (Other Languages)', otherVoices);
+            }
+
+            // 尝试恢复保存的语音选择
+            const savedVoice = voiceSelect.dataset.savedValue;
+            if (savedVoice && voiceSelect.querySelector(\`option[value="\${savedVoice}"]\`)) {
+              voiceSelect.value = savedVoice;
+            } else {
+              // 默认选择晓晓多语言
+              const defaultVoice = 'zh-CN-XiaoxiaoMultilingualNeural';
+              if (voiceSelect.querySelector(\`option[value="\${defaultVoice}"]\`)) {
+                voiceSelect.value = defaultVoice;
+              }
+            }
+
+            // 加载初始选择语音的风格选项
+            updateStyleOptions(voiceSelect.value);
+
+            // 尝试恢复保存的风格选择
+            const savedStyle = localStorage.getItem('tts_style');
+            if (savedStyle) {
+              setTimeout(() => {
+                const styleSelect = document.getElementById('style');
+                if (styleSelect.querySelector(\`option[value="\${savedStyle}"]\`)) {
+                  styleSelect.value = savedStyle;
+                }
+              }, 100); // 给updateStyleOptions一点时间来填充选项
+            }
+
+            // 添加语音选择变化事件监听器，保存选择到localStorage
+            voiceSelect.addEventListener('change', function() {
+              localStorage.setItem('tts_voice', this.value);
+              updateStyleOptions(this.value);
+            });
+
+            // 添加语速变化事件监听器
+            document.getElementById('rate').addEventListener('change', function() {
+              localStorage.setItem('tts_rate', this.value);
+            });
+
+            // 添加音调变化事件监听器
+            document.getElementById('pitch').addEventListener('change', function() {
+              localStorage.setItem('tts_pitch', this.value);
+            });
+
+            // 添加文本变化事件监听器
+            document.getElementById('text').addEventListener('input', function() {
+              localStorage.setItem('tts_text', this.value);
+            });
+
+          } else {
+            console.error('获取语音列表失败：', response.status);
+            showDefaultVoices();
+          }
+        } catch (error) {
+          console.error('加载语音列表失败:', error);
+          showDefaultVoices();
+        }
+      }
+
+      // 添加语音组到下拉框
+      function addVoiceGroup(select, groupName, voices) {
+        const group = document.createElement('optgroup');
+        group.label = groupName;
+
+        // 对语音按名称排序
+        voices.sort((a, b) => {
+          const nameA = a.LocalName || a.DisplayName;
+          const nameB = b.LocalName || b.DisplayName;
+          return nameA.localeCompare(nameB);
+        });
+
+        voices.forEach(voice => {
+          const option = document.createElement('option');
+          option.value = voice.ShortName;
+          option.text = \`\${voice.LocalName || voice.DisplayName} (\${voice.Gender === 'Female' ? '女' : '男'})\`;
+          group.appendChild(option);
+        });
+
+        select.appendChild(group);
+      }
+
+      // 加载默认语音列表
+      function showDefaultVoices() {
+        document.getElementById('voiceLoadError').style.display = 'block';
+        const voiceSelect = document.getElementById('voice');
+        voiceSelect.innerHTML = '';
+
+        const defaultVoices = [
+          { value: "zh-CN-XiaoxiaoMultilingualNeural", text: "晓晓多语言(女) - zh-CN-XiaoxiaoMultilingualNeural" },
+          { value: "zh-CN-XiaoxiaoNeural", text: "晓晓(女) - zh-CN-XiaoxiaoNeural" },
+          { value: "zh-CN-YunxiNeural", text: "云希(男) - zh-CN-YunxiNeural" },
+          { value: "zh-CN-XiaomoNeural", text: "晓墨(女) - zh-CN-XiaomoNeural" },
+          { value: "zh-CN-YunjianNeural", text: "云健(男) - zh-CN-YunjianNeural" },
+          { value: "zh-CN-XiaochenNeural", text: "晓陈(儿童) - zh-CN-XiaochenNeural" },
+          { value: "en-US-AriaNeural", text: "Aria(女) - en-US-AriaNeural" },
+          { value: "en-US-GuyNeural", text: "Guy(男) - en-US-GuyNeural" }
+        ];
+
+        const group = document.createElement('optgroup');
+        group.label = '默认语音';
+
+        defaultVoices.forEach(voice => {
+          const option = document.createElement('option');
+          option.value = voice.value;
+          option.text = voice.text;
+          group.appendChild(option);
+        });
+
+        voiceSelect.appendChild(group);
+
+        // 默认选择晓晓多语言
+        voiceSelect.value = "zh-CN-XiaoxiaoMultilingualNeural";
+
+        // 设置默认风格
+        const styleSelect = document.getElementById('style');
+        styleSelect.innerHTML = '';
+        const defaultOption = document.createElement('option');
+        defaultOption.value = 'general';
+        defaultOption.text = '标准';
+        styleSelect.appendChild(defaultOption);
+      }
+
+      // 页面加载完成后加载语音列表
+      window.onload = function() {
+        // 先加载保存的表单值
+        loadFormValuesFromLocalStorage();
+
+        // 然后加载语音列表
+        loadVoices();
+
+        // API Key 相关功能
+        const apiKeyInput = document.getElementById('apiKey');
+        const saveApiKeyBtn = document.getElementById('saveApiKey');
+        const editApiKeyBtn = document.getElementById('editApiKey');
+        const savedApiKeyInfo = document.getElementById('savedApiKeyInfo');
+        const apiKeyInputGroup = document.getElementById('apiKeyInputGroup');
+        const toggleApiKeyVisibilityBtn = document.getElementById('toggleApiKeyVisibility');
+
+        // 显示/隐藏API Key
+        toggleApiKeyVisibilityBtn.addEventListener('click', function() {
+          const type = apiKeyInput.getAttribute('type') === 'password' ? 'text' : 'password';
+          apiKeyInput.setAttribute('type', type);
+
+          // 修改图标
+          if (type === 'text') {
+            this.innerHTML = \`<svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l18 18" />
+            </svg>\`;
+          } else {
+            this.innerHTML = \`<svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 06 0z" />
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+            </svg>\`;
+          }
+        });
+
+        // 保存API Key到localStorage
+        saveApiKeyBtn.addEventListener('click', function() {
+          const apiKey = apiKeyInput.value.trim();
+          if (apiKey) {
+            localStorage.setItem('tts_api_key', apiKey);
+            apiKeyInputGroup.style.display = 'none';
+            saveApiKeyBtn.style.display = 'none';
+            savedApiKeyInfo.style.display = 'flex';
+          } else {
+            alert('请输入有效的API Key');
+          }
+        });
+
+        // 编辑已保存的API Key
+        editApiKeyBtn.addEventListener('click', function() {
+          apiKeyInputGroup.style.display = 'flex';
+          saveApiKeyBtn.style.display = 'inline-flex';
+          savedApiKeyInfo.style.display = 'none';
+        });
+
+        // 检查是否有保存的API Key
+        const savedApiKey = localStorage.getItem('tts_api_key');
+        if (savedApiKey) {
+          apiKeyInput.value = savedApiKey;
+          apiKeyInputGroup.style.display = 'none';
+          saveApiKeyBtn.style.display = 'none';
+          savedApiKeyInfo.style.display = 'flex';
+        }
+      };
+
+    </script>
+  </body>
+  </html>
+  `, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8'}});
 }
 
-// 主处理函数
-export default {
-    async fetch(request, env, ctx) {
-        const url = new URL(request.url);
-        const path = url.pathname;
-        
-        // 主页
-        if (path === '/' || path === '') {
-            const scuValue = env?.scu || scu;
-            return new Response(generateHomePage(scuValue), {
-                headers: { 'Content-Type': 'text/html; charset=utf-8' }
-            });
-        }
-        
-        // 订阅请求格式: /{UUID}/sub?domain=xxx&epd=yes&epi=yes&egi=yes
-        const pathMatch = path.match(/^\/([^\/]+)\/sub$/);
-        if (pathMatch) {
-            const uuid = pathMatch[1];
-            
-            if (!isValidUUID(uuid)) {
-                return new Response('无效的UUID格式', { status: 400 });
-            }
-            
-            const domain = url.searchParams.get('domain');
-            if (!domain) {
-                return new Response('缺少域名参数', { status: 400 });
-            }
-            
-            // 从URL参数获取配置
-            epd = url.searchParams.get('epd') !== 'no';
-            epi = url.searchParams.get('epi') !== 'no';
-            egi = url.searchParams.get('egi') !== 'no';
-            const piu = url.searchParams.get('piu') || defaultIPURL;
-            
-            // 协议选择
-            const evEnabled = url.searchParams.get('ev') === 'yes' || (url.searchParams.get('ev') === null && ev);
-            const etEnabled = url.searchParams.get('et') === 'yes';
-            const vmEnabled = url.searchParams.get('vm') === 'yes';
-            
-            // IPv4/IPv6选择
-            const ipv4Enabled = url.searchParams.get('ipv4') !== 'no';
-            const ipv6Enabled = url.searchParams.get('ipv6') !== 'no';
-            
-            // 运营商选择
-            const ispMobile = url.searchParams.get('ispMobile') !== 'no';
-            const ispUnicom = url.searchParams.get('ispUnicom') !== 'no';
-            const ispTelecom = url.searchParams.get('ispTelecom') !== 'no';
-            
-            // TLS控制
-            const disableNonTLS = url.searchParams.get('dkby') === 'yes';
-            
-            // 自定义路径
-            const customPath = url.searchParams.get('path') || '/';
-            
-            return await handleSubscriptionRequest(request, uuid, domain, piu, ipv4Enabled, ipv6Enabled, ispMobile, ispUnicom, ispTelecom, evEnabled, etEnabled, vmEnabled, disableNonTLS, customPath);
-        }
-        
-        return new Response('Not Found', { status: 404 });
-    }
-};
+addEventListener('fetch', event => {
+  event.respondWith(handleRequest(event.request));
+});
 
+
+async function getEndpoint() {
+  const endpointUrl = 'https://dev.microsofttranslator.com/apps/endpoint?api-version=1.0';
+  const headers = {
+    'Accept-Language': 'zh-Hans',
+    'X-ClientVersion': '4.0.530a 5fe1dc6c',
+    'X-UserId': generateUserId(), // 使用随机生成的UserId
+    'X-HomeGeographicRegion': 'zh-Hans-CN',
+    'X-ClientTraceId': uuid(), // 直接使用uuid函数生成
+
+    'X-MT-Signature': await sign(endpointUrl),
+    'User-Agent': 'okhttp/4.5.0',
+    'Content-Type': 'application/json',
+    'Content-Length': '0',
+    'Accept-Encoding': 'gzip'
+  };
+
+  return fetch(endpointUrl, {
+    method: 'POST',
+    headers: headers
+  }).then(res => res.json());
+}
+
+// 随机生成 X-UserId，格式为 16 位字符（字母+数字）
+function generateUserId() {
+  const chars = 'abcdef0123456789'; // 只使用16进制字符，与原格式一致
+  let result = '';
+  for (let i = 0; i < 16; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+}
+
+async function sign(urlStr) {
+  const url = urlStr.split('://')[1];
+  const encodedUrl = encodeURIComponent(url);
+  const uuidStr = uuid();
+  const formattedDate = dateFormat();
+  const bytesToSign = `MSTranslatorAndroidApp${encodedUrl}${formattedDate}${uuidStr}`.toLowerCase();
+  const decode = await base64ToBytes('oik6PdDdMnOXemTbwvMn9de/h9lFnfBaCWbGMMZqqoSaQaqUOqjVGm5NqsmjcBI1x+sS9ugjB55HEJWRiFXYFw==');
+  const signData = await hmacSha256(decode, bytesToSign);
+  const signBase64 = await bytesToBase64(signData);
+  return `MSTranslatorAndroidApp::${signBase64}::${formattedDate}::${uuidStr}`;
+}
+
+function dateFormat() {
+  const formattedDate = new Date().toUTCString().replace(/GMT/, '').trim() + 'GMT';
+  return formattedDate.toLowerCase();
+}
+
+function getSsml(text, voiceName, rate, pitch, style = 'general') {
+  text = escapeSSML(text);
+  return `<speak xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" version="1.0" xml:lang="zh-CN"> <voice name="${voiceName}"> <mstts:express-as style="${style}" styledegree="1.0" role="default"> <prosody rate="${rate}%" pitch="${pitch}%" volume="50">${text}</prosody> </mstts:express-as> </voice> </speak>`;
+}
+
+function voiceList() {
+  // 检查缓存是否有效
+  if (voiceListCache && voiceListCacheTime && (Date.now() - voiceListCacheTime) < VOICE_CACHE_DURATION) {
+    console.log('使用缓存的语音列表数据，剩余有效���：',
+      Math.round((VOICE_CACHE_DURATION - (Date.now() - voiceListCacheTime)) / 60000), '分钟');
+    return Promise.resolve(voiceListCache);
+  }
+
+  console.log('获取新的语音列表数据');
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 Edg/107.0.1418.26',
+    'X-Ms-Useragent': 'SpeechStudio/2021.05.001',
+    'Content-Type': 'application/json',
+    'Origin': 'https://azure.microsoft.com',
+    'Referer': 'https://azure.microsoft.com'
+  };
+
+  return fetch('https://eastus.api.speech.microsoft.com/cognitiveservices/voices/list', {
+    headers: headers,
+  })
+  .then(res => res.json())
+  .then(data => {
+    // 更新缓存
+    voiceListCache = data;
+    voiceListCacheTime = Date.now();
+    return data;
+  });
+}
+
+async function hmacSha256(key, data) {
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    key,
+    { name: 'HMAC', hash: { name: 'SHA-256' } },
+    false,
+    ['sign']
+  );
+  const signature = await crypto.subtle.sign('HMAC', cryptoKey, new TextEncoder().encode(data));
+return new Uint8Array(signature);
+}
+
+async function base64ToBytes(base64) {
+  const binaryString = atob(base64);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+async function bytesToBase64(bytes) {
+  const base64 = btoa(String.fromCharCode.apply(null, bytes));
+  return base64;
+}
+
+
+
+// API 密钥验证函数
+function validateApiKey(apiKey) {
+  // 从环境变量获取 API 密钥并进行验证
+  const expectedApiKey = API_KEY || '';
+  return apiKey === expectedApiKey;
+}
+
+async function getVoice(text, voiceName = 'zh-CN-XiaoxiaoMultilingualNeural', rate = 0, pitch = 0, style = 'general', outputFormat='audio-24khz-48kbitrate-mono-mp3', download=false) {
+  // get expiredAt from endpoint.t (jwt token)
+  if (!expiredAt || Date.now() / 1000 > expiredAt - 60) {
+    endpoint = await getEndpoint();
+    const jwt = endpoint.t.split('.')[1];
+    const decodedJwt = JSON.parse(atob(jwt));
+    expiredAt = decodedJwt.exp;
+    const seconds = (expiredAt - Date.now() / 1000);
+    clientId = uuid();
+    console.log('getEndpoint, expiredAt:' + (seconds/ 60) + 'm left')
+  } else {
+    const seconds = (expiredAt - Date.now() / 1000);
+    console.log('expiredAt:' + (seconds/ 60) + 'm left')
+  }
+
+  const url = `https://${endpoint.r}.tts.speech.microsoft.com/cognitiveservices/v1`;
+  const headers = {
+    'Authorization': endpoint.t,
+    'Content-Type': 'application/ssml+xml',
+    'User-Agent': 'okhttp/4.5.0',
+    'X-Microsoft-OutputFormat': outputFormat
+  };
+  const ssml = getSsml(text, voiceName, rate, pitch, style);
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: headers,
+    body: ssml
+  });
+  if(response.ok) {
+    if (!download) {
+      return response;
+    }
+    const resp = new Response(response.body, response);
+    resp.headers.set('Content-Disposition', `attachment; filename="${uuid()}.mp3"`);
+    return resp;
+  } else {
+    return new Response(response.statusText, { status: response.status });
+  }
+}
+
+// 处理 OpenAI 格式的文本转语音请求
+async function handleOpenAITTS(request) {
+  // 验证请求方法是否为 POST
+  if (request.method !== 'POST') {
+    return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+      status: 405,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  // 验证 API 密钥
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return new Response(JSON.stringify({ error: 'Unauthorized: Missing or invalid API key' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  const apiKey = authHeader.replace('Bearer ', '');
+  if (!validateApiKey(apiKey)) {
+    return new Response(JSON.stringify({ error: 'Unauthorized: Invalid API key' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  try {
+    // 解析请求体 JSON
+    const requestData = await request.json();
+
+    // 验证必要参数
+    if (!requestData.model || !requestData.input) {
+      return new Response(JSON.stringify({ error: 'Bad request: Missing required parameters' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // 提取参数
+    const text = requestData.input;
+    // 映射 voice 参数 (可选择添加 model 到 voice 的映射逻辑)
+    let voiceName = 'zh-CN-XiaoxiaoMultilingualNeural'; // 默认声音
+    if (requestData.voice) {
+      // OpenAI的voice参数有alloy, echo, fable, onyx, nova, shimmer
+      // 可以根据需要进行映射
+      const voiceMap = {
+        'alloy': 'zh-CN-XiaoxiaoMultilingualNeural',
+        'echo': 'zh-CN-YunxiNeural',
+        'fable': 'zh-CN-XiaomoNeural',
+        'onyx': 'zh-CN-YunjianNeural',
+        'nova': 'zh-CN-XiaochenNeural',
+        'shimmer': 'en-US-AriaNeural'
+      };
+      voiceName = voiceMap[requestData.voice] || requestData.voice;
+    }
+
+    // 速度和音调映射 (OpenAI 使用 0.25-4.0，我们使用 -100 到 100)
+    let rate = 0;
+    if (requestData.speed) {
+      // 映射 0.25-4.0 到 -100 到 100 范围
+      // 1.0 是正常速度，对应 rate=0
+      rate = Math.round((requestData.speed - 1.0) * 100);
+      // 限制范围
+      rate = Math.max(-100, Math.min(100, rate));
+    }
+
+    // 设置输出格式
+    const outputFormat = requestData.response_format === 'opus' ?
+      'audio-48khz-192kbitrate-mono-opus' :
+      'audio-24khz-48kbitrate-mono-mp3';
+
+    // 调用 TTS API
+    const ttsResponse = await getVoice(text, voiceName, rate, 0,requestData.model ,outputFormat, false);
+
+    return ttsResponse;
+  } catch (error) {
+    console.error('OpenAI TTS API error:', error);
+    return new Response(JSON.stringify({ error: 'Internal server error: ' + error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
